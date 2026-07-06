@@ -1,0 +1,51 @@
+{
+  "name": "@weiqi/worker",
+  "version": "0.1.0",
+  "description": "Weiqi AI inference worker - neural network and MCTS analysis engine",
+  "type": "module",
+  "files": [
+    "dist/assets/worker.js"
+  ],
+  "scripts": {
+    "dev": "vite build --watch",
+    "build": "tsc && vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "test:coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "@tensorflow/tfjs": "^4.22.0",
+    "@tensorflow/tfjs-backend-wasm": "^4.22.0",
+    "@tensorflow/tfjs-backend-webgpu": "^4.22.0",
+    "pako": "^2.1.0"
+  },
+  "devDependencies": {
+    "@types/pako": "^2.0.4",
+    "typescript": "^5.7.3",
+    "vite": "^6.3.4",
+    "vitest": "^1.6.0",
+    "@vitest/coverage-v8": "^1.6.0"
+  },
+  "keywords": [
+    "weiqi",
+    "go",
+    "baduk",
+    "ai",
+    "worker",
+    "inference",
+    "mcts",
+    "tensorflow",
+    "neural-network"
+  ],
+  "author": "Weiqi Project Contributors",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zhangbin2025/weiqi-worker.git"
+  },
+  "bugs": {
+    "url": "https://github.com/zhangbin2025/weiqi-worker/issues"
+  },
+  "homepage": "https://github.com/zhangbin2025/weiqi-worker#readme"
+}

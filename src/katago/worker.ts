@@ -1,0 +1,1003 @@
+/// <reference lib="webworker" />
+
+import * as tf from '@tensorflow/tfjs';
+import '@tensorflow/tfjs-backend-webgpu';
+import '@tensorflow/tfjs-backend-wasm';
+import { setWasmPaths, setThreadsCount } from '@tensorflow/tfjs-backend-wasm';
+import pako from 'pako';
+
+import type { KataGoAnalyzeRequest, KataGoWorkerRequest, KataGoWorkerResponse } from './types';
+import type { BoardState, GameRules, Move, Player, RegionOfInterest } from '../types';
+import { publicUrl } from '../utils/publicUrl';
+import { parseKataGoModelV8 } from './loadModelV8';
+import { KataGoModelV8Tf } from './modelV8';
+import { ENGINE_MAX_TIME_MS, ENGINE_MAX_VISITS } from './limits';
+import { MctsSearch, type OwnershipMode } from './analyzeMcts';
+import { fillInputsV7Fast, type RecentMove } from './featuresV7Fast';
+import {
+  BLACK,
+  BOARD_AREA,
+  BOARD_SIZE,
+  PASS_MOVE,
+  WHITE,
+  computeAreaMapV7KataGoInto,
+  computeLadderFeaturesV7KataGoInto,
+  computeLadderedStonesV7KataGoInto,
+  computeLibertyMapInto,
+  playMove,
+  setBoardSize,
+  type SimPosition,
+  type StoneColor,
+} from './fastBoard';
+import { postprocessKataGoV8 } from './evalV8';
+
+// ========== 调试日志功能 ==========
+// 运行时调试开关，默认禁用，在第一个 init 消息中设置
+let debugEnabled = false;
+
+/**
+ * 设置调试开关状态
+ * @param enabled - 是否启用调试日志
+ */
+export function setDebugEnabled(enabled: boolean): void {
+  debugEnabled = enabled;
+}
+
+/**
+ * 发送调试日志到主线程
+ * @param level - 日志级别
+ * @param message - 日志消息
+ * @param data - 附加数据（可选）
+ */
+function debugLog(level: 'log' | 'warn' | 'error', message: string, data?: unknown): void {
+  if (!debugEnabled) return;
+  
+  // 同时打印到 Worker 控制台（Chrome DevTools 可见）
+  console[level](`[KataGo Worker] ${message}`, data ?? '');
+  
+  // 发送到主线程
+  post({
+    type: 'katago:debug_log',
+    level,
+    message,
+    data
+  });
+}
+
+let model: KataGoModelV8Tf | null = null;
+let loadedModelName: string | undefined;
+let loadedModelUrl: string | null = null;
+let backendPromise: Promise<void> | null = null;
+let queue: Promise<void> = Promise.resolve();
+
+let V7_SPATIAL_STRIDE = BOARD_AREA * 22;
+const V7_GLOBAL_STRIDE = 19;
+
+let evalSpatialV7 = new Float32Array(V7_SPATIAL_STRIDE);
+let evalGlobalV7 = new Float32Array(V7_GLOBAL_STRIDE);
+
+let stonesScratch = new Uint8Array(BOARD_AREA);
+let prevStonesScratch = new Uint8Array(BOARD_AREA);
+let prevPrevStonesScratch = new Uint8Array(BOARD_AREA);
+
+let koSimStonesScratch = new Uint8Array(BOARD_AREA);
+let koSimPosScratch: SimPosition = { stones: koSimStonesScratch, koPoint: -1 };
+const koCaptureStackScratch: number[] = [];
+
+let libertyMapScratch = new Uint8Array(BOARD_AREA);
+let areaMapScratch = new Uint8Array(BOARD_AREA);
+
+let ladderedStonesScratch = new Uint8Array(BOARD_AREA);
+let ladderWorkingMovesScratch = new Uint8Array(BOARD_AREA);
+let prevLadderedStonesScratch = new Uint8Array(BOARD_AREA);
+let prevPrevLadderedStonesScratch = new Uint8Array(BOARD_AREA);
+
+let evalBatchCapacity = 0;
+let evalBatchSpatialV7 = new Float32Array(0);
+let evalBatchGlobalV7 = new Float32Array(0);
+let scratchBoardSize = BOARD_SIZE;
+
+function regionKey(roi?: RegionOfInterest | null): string | null {
+  if (!roi) return null;
+  const xMin = Math.max(0, Math.min(BOARD_SIZE - 1, Math.min(roi.xMin, roi.xMax)));
+  const xMax = Math.max(0, Math.min(BOARD_SIZE - 1, Math.max(roi.xMin, roi.xMax)));
+  const yMin = Math.max(0, Math.min(BOARD_SIZE - 1, Math.min(roi.yMin, roi.yMax)));
+  const yMax = Math.max(0, Math.min(BOARD_SIZE - 1, Math.max(roi.yMin, roi.yMax)));
+  const isSinglePoint = xMin === xMax && yMin === yMax;
+  const isWholeBoard = xMin === 0 && yMin === 0 && xMax === BOARD_SIZE - 1 && yMax === BOARD_SIZE - 1;
+  if (isSinglePoint || isWholeBoard) return null;
+  return `${xMin},${xMax},${yMin},${yMax}`;
+}
+
+function getEvalBatchBuffersV7(batch: number): { spatial: Float32Array; global: Float32Array } {
+  if (batch > evalBatchCapacity) {
+    evalBatchCapacity = batch;
+    evalBatchSpatialV7 = new Float32Array(batch * V7_SPATIAL_STRIDE);
+    evalBatchGlobalV7 = new Float32Array(batch * V7_GLOBAL_STRIDE);
+  }
+  return {
+    spatial: evalBatchSpatialV7.subarray(0, batch * V7_SPATIAL_STRIDE),
+    global: evalBatchGlobalV7.subarray(0, batch * V7_GLOBAL_STRIDE),
+  };
+}
+
+function playerToColor(p: Player): StoneColor {
+  return p === 'black' ? BLACK : WHITE;
+}
+
+function boardStateToStonesInto(board: BoardState, out: Uint8Array): void {
+  out.fill(0);
+  for (let y = 0; y < BOARD_SIZE; y++) {
+    const row = board[y];
+    for (let x = 0; x < BOARD_SIZE; x++) {
+      const v = row?.[x] ?? null;
+      if (!v) continue;
+      out[y * BOARD_SIZE + x] = v === 'black' ? BLACK : WHITE;
+    }
+  }
+}
+
+function movesToRecentMoves(moves: Move[]): RecentMove[] {
+  const out = new Array<RecentMove>(moves.length);
+  for (let i = 0; i < moves.length; i++) {
+    const m = moves[i]!;
+    out[i] = {
+      move: m.x < 0 || m.y < 0 ? PASS_MOVE : m.y * BOARD_SIZE + m.x,
+      player: m.player,
+    };
+  }
+  return out;
+}
+
+function countHistoryTurnsIncluded(args: { recentMoves: RecentMove[]; currentPlayer: Player; conservativePassAndIsRoot: boolean }): number {
+  const lastMove = args.recentMoves.length > 0 ? args.recentMoves[args.recentMoves.length - 1] : null;
+  const passWouldEndGame = lastMove?.move === PASS_MOVE;
+  if (args.conservativePassAndIsRoot && passWouldEndGame) return 0;
+
+  const pla = args.currentPlayer;
+  const opp = pla === 'black' ? 'white' : 'black';
+  const expectedPlayers: Player[] = [opp, pla, opp, pla, opp];
+
+  let included = 0;
+  for (let i = 0; i < 5; i++) {
+    const m = args.recentMoves[args.recentMoves.length - 1 - i];
+    if (!m) break;
+    if (m.player !== expectedPlayers[i]) break;
+    included++;
+  }
+  return included;
+}
+
+function computeKoPointAfterMove(previousStones: Uint8Array, move: Move | null): number {
+  if (!move || move.x < 0 || move.y < 0) return -1;
+
+  koSimStonesScratch.set(previousStones);
+  koSimPosScratch.koPoint = -1;
+  koCaptureStackScratch.length = 0;
+
+  try {
+    playMove(koSimPosScratch, move.y * BOARD_SIZE + move.x, playerToColor(move.player), koCaptureStackScratch);
+    return koSimPosScratch.koPoint;
+  } catch {
+    return -1;
+  }
+}
+
+function fillInputsV7FastForPosition(args: {
+  board: BoardState;
+  previousBoard?: BoardState;
+  previousPreviousBoard?: BoardState;
+  currentPlayer: Player;
+  moveHistory: Move[];
+  komi: number;
+  rules: GameRules;
+  conservativePassAndIsRoot: boolean;
+  outSpatial: Float32Array;
+  outGlobal: Float32Array;
+}): void {
+  boardStateToStonesInto(args.board, stonesScratch);
+
+  if (args.previousBoard) boardStateToStonesInto(args.previousBoard, prevStonesScratch);
+  else prevStonesScratch.set(stonesScratch);
+
+  if (args.previousPreviousBoard) boardStateToStonesInto(args.previousPreviousBoard, prevPrevStonesScratch);
+  else prevPrevStonesScratch.set(prevStonesScratch);
+
+  const lastMove = args.moveHistory.length > 0 ? args.moveHistory[args.moveHistory.length - 1]! : null;
+  const prevMove = args.moveHistory.length >= 2 ? args.moveHistory[args.moveHistory.length - 2]! : null;
+
+  const koPoint = args.previousBoard ? computeKoPointAfterMove(prevStonesScratch, lastMove) : -1;
+  const prevKoPoint = args.previousPreviousBoard ? computeKoPointAfterMove(prevPrevStonesScratch, prevMove) : -1;
+  const prevPrevKoPoint = -1;
+
+  const recentMoves = movesToRecentMoves(args.moveHistory);
+  const numTurnsOfHistoryIncluded = countHistoryTurnsIncluded({
+    recentMoves,
+    currentPlayer: args.currentPlayer,
+    conservativePassAndIsRoot: args.conservativePassAndIsRoot,
+  });
+
+  const prevLadderStones = numTurnsOfHistoryIncluded < 1 ? stonesScratch : prevStonesScratch;
+  const prevLadderKoPoint = numTurnsOfHistoryIncluded < 1 ? koPoint : prevKoPoint;
+
+  const prevPrevLadderStones = numTurnsOfHistoryIncluded < 2 ? prevLadderStones : prevPrevStonesScratch;
+  const prevPrevLadderKoPoint = numTurnsOfHistoryIncluded < 2 ? prevLadderKoPoint : prevPrevKoPoint;
+
+  computeLibertyMapInto(stonesScratch, libertyMapScratch);
+  if (args.rules === 'chinese') computeAreaMapV7KataGoInto(stonesScratch, areaMapScratch);
+
+  computeLadderFeaturesV7KataGoInto({
+    stones: stonesScratch,
+    koPoint,
+    currentPlayer: playerToColor(args.currentPlayer),
+    outLadderedStones: ladderedStonesScratch,
+    outLadderWorkingMoves: ladderWorkingMovesScratch,
+  });
+  computeLadderedStonesV7KataGoInto({
+    stones: prevLadderStones,
+    koPoint: prevLadderKoPoint,
+    outLadderedStones: prevLadderedStonesScratch,
+  });
+  computeLadderedStonesV7KataGoInto({
+    stones: prevPrevLadderStones,
+    koPoint: prevPrevLadderKoPoint,
+    outLadderedStones: prevPrevLadderedStonesScratch,
+  });
+
+  fillInputsV7Fast({
+    stones: stonesScratch,
+    koPoint,
+    currentPlayer: args.currentPlayer,
+    recentMoves,
+    komi: args.komi,
+    rules: args.rules,
+    conservativePassAndIsRoot: args.conservativePassAndIsRoot,
+    libertyMap: libertyMapScratch,
+    areaMap: args.rules === 'chinese' ? areaMapScratch : undefined,
+    ladderedStones: ladderedStonesScratch,
+    prevLadderedStones: prevLadderedStonesScratch,
+    prevPrevLadderedStones: prevPrevLadderedStonesScratch,
+    ladderWorkingMoves: ladderWorkingMovesScratch,
+    outSpatial: args.outSpatial,
+    outGlobal: args.outGlobal,
+  });
+}
+
+let search: MctsSearch | null = null;
+let searchKey: {
+  positionId: string;
+  modelUrl: string;
+  boardSize: number;
+  maxChildren: number;
+  ownershipMode: OwnershipMode;
+  komi: number;
+  currentPlayer: 'black' | 'white';
+  wideRootNoise: number;
+  rules: GameRules;
+  nnRandomize: boolean;
+  conservativePass: boolean;
+  roiKey: string | null;
+} | null = null;
+const latestAnalyzeByGroup = new Map<string, number>();
+let interactiveToken = 0;
+const analyzeMeta = new WeakMap<KataGoAnalyzeRequest, { analysisGroup: 'interactive' | 'background'; interactiveToken: number }>();
+
+function ensureBoardSizeForWorker(boardSize: number): void {
+  if (boardSize === scratchBoardSize) return;
+  setBoardSize(boardSize);
+  scratchBoardSize = BOARD_SIZE;
+  V7_SPATIAL_STRIDE = BOARD_AREA * 22;
+  evalSpatialV7 = new Float32Array(V7_SPATIAL_STRIDE);
+  evalGlobalV7 = new Float32Array(V7_GLOBAL_STRIDE);
+  stonesScratch = new Uint8Array(BOARD_AREA);
+  prevStonesScratch = new Uint8Array(BOARD_AREA);
+  prevPrevStonesScratch = new Uint8Array(BOARD_AREA);
+  koSimStonesScratch = new Uint8Array(BOARD_AREA);
+  koSimPosScratch = { stones: koSimStonesScratch, koPoint: -1 };
+  libertyMapScratch = new Uint8Array(BOARD_AREA);
+  areaMapScratch = new Uint8Array(BOARD_AREA);
+  ladderedStonesScratch = new Uint8Array(BOARD_AREA);
+  ladderWorkingMovesScratch = new Uint8Array(BOARD_AREA);
+  prevLadderedStonesScratch = new Uint8Array(BOARD_AREA);
+  prevPrevLadderedStonesScratch = new Uint8Array(BOARD_AREA);
+  evalBatchCapacity = 0;
+  evalBatchSpatialV7 = new Float32Array(0);
+  evalBatchGlobalV7 = new Float32Array(0);
+  search = null;
+  searchKey = null;
+}
+
+/**
+ * Initialize TensorFlow.js backend with fallback mechanism.
+ * Tries: WebGPU → WebGL → WASM → CPU
+ * 
+ * Note: TensorFlow.js may produce warnings during initialization:
+ * - 'The powerPreference option is currently ignored when calling requestAdapter() on Windows'
+ * - 'No available adapters'
+ * - 'Initialization of backend webgpu failed'
+ * These are expected warnings as part of the fallback mechanism.
+ * They indicate TensorFlow.js is trying different backends.
+ */
+async function initBackend(): Promise<void> {
+  debugLog('log', 'Initializing backend');
+  
+  // DISABLED: WebGPU backend (for testing purposes)
+  // Try WebGPU first (best performance if available)
+  // Note: WebGPU may not work in Worker on some platforms (e.g., Windows)
+  // TensorFlow.js may silently fall back to WebGL, so we need to check actual backend
+  /*
+  try {
+    debugLog('log', 'Trying WebGPU backend');
+    if (!navigator.gpu) {
+      debugLog('log', 'WebGPU API not available (navigator.gpu is null)');
+      throw new Error('WebGPU API not available');
+    }
+    await tf.setBackend('webgpu');
+    debugLog('log', 'tf.setBackend("webgpu") called, calling tf.ready()');
+    await tf.ready();
+    const actualBackend = tf.getBackend();
+    if (actualBackend !== 'webgpu') {
+      debugLog('log', `WebGPU initialization failed - actual backend is ${actualBackend}`);
+      throw new Error(`WebGPU initialization failed - actual backend is ${actualBackend}`);
+    }
+    debugLog('log', 'WebGPU backend initialized successfully');
+    return;
+  } catch (err) {
+    debugLog('log', 'WebGPU backend failed, trying WebGL', err);
+  }
+  */
+  debugLog('warn', 'WebGPU backend DISABLED - skipping to WebGL');
+
+  // Try WebGL (best browser support and performance)
+  try {
+    debugLog('log', 'Trying WebGL backend');
+    await tf.setBackend('webgl');
+    await tf.ready();
+    debugLog('log', 'WebGL backend initialized successfully');
+    return;
+  } catch (err) {
+    debugLog('log', 'WebGL backend failed, trying WASM', err);
+  }
+
+  // Try WASM if WebGL fails
+  try {
+    debugLog('log', 'Trying WASM backend');
+    
+    // Set WASM paths before initializing WASM backend
+    setWasmPaths('../tfjs/');
+    const isCrossOriginIsolated = (globalThis as unknown as { crossOriginIsolated?: boolean }).crossOriginIsolated === true;
+    if (isCrossOriginIsolated) {
+      const hc = (globalThis as unknown as { navigator?: { hardwareConcurrency?: number } }).navigator?.hardwareConcurrency ?? 1;
+      const numThreads = Math.max(1, Math.min(8, Math.floor(hc)));
+      setThreadsCount(numThreads);
+      debugLog('log', `WASM using ${numThreads} threads`);
+    }
+    await tf.setBackend('wasm');
+    await tf.ready();
+    debugLog('log', 'WASM backend initialized successfully');
+    return;
+  } catch (err) {
+    debugLog('log', 'WASM backend failed, falling back to CPU', err);
+    // Fall through to CPU
+  }
+
+  // Last resort: CPU backend
+  debugLog('log', 'Using CPU backend (slow)');
+  await tf.setBackend('cpu');
+  await tf.ready();
+  debugLog('log', 'CPU backend initialized');
+}
+
+function maybeUngzip(data: Uint8Array): Uint8Array {
+  // gzip magic bytes 0x1f8b
+  if (data.length >= 2 && data[0] === 0x1f && data[1] === 0x8b) return pako.ungzip(data);
+  return data;
+}
+
+async function ensureBackend(): Promise<void> {
+  if (!backendPromise) {
+    debugLog('log', 'Creating new backend promise');
+    backendPromise = initBackend()
+      .then(() => {
+        tf.enableProdMode();
+        debugLog('log', 'Backend ready, prod mode enabled');
+      })
+      .catch((err) => {
+        debugLog('error', 'Backend initialization failed', err);
+        backendPromise = null;
+        throw err;
+      });
+  } else {
+    debugLog('log', 'Reusing existing backend promise');
+  }
+  await backendPromise;
+}
+
+async function ensureModel(modelUrl: string): Promise<void> {
+  debugLog('log', 'ensureModel called', { modelUrl, currentLoadedUrl: loadedModelUrl });
+  
+  await ensureBackend();
+  if (model && loadedModelUrl === modelUrl) {
+    debugLog('log', 'Model already loaded, reusing', { modelName: loadedModelName });
+    return;
+  }
+  
+  debugLog('log', 'Starting model download', { modelUrl });
+
+
+  // 使用流式下载以支持进度报告
+  const res = await fetch(modelUrl);
+  if (!res.ok) throw new Error(`Failed to fetch model: ${res.status} ${res.statusText}`);
+
+  const contentLength = res.headers.get('content-length');
+  const total = contentLength ? parseInt(contentLength, 10) : 0;
+
+  let loaded = 0;
+  const chunks: Uint8Array[] = [];
+
+  if (res.body) {
+    const reader = res.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      loaded += value.length;
+
+      // 报告下载进度
+      if (total > 0) {
+        const progress = Math.min((loaded / total) * 100, 100);  // 限制不超过 100%
+        post({
+          type: 'katago:progress',
+          loaded,
+          total,
+          progress
+        });
+      }
+    }
+
+    // 合并所有 chunks
+    const buf = new Uint8Array(loaded);
+    let offset = 0;
+    for (const chunk of chunks) {
+      buf.set(chunk, offset);
+      offset += chunk.length;
+    }
+
+    const data = maybeUngzip(buf);
+    const parsed = parseKataGoModelV8(data);
+    model?.dispose();
+    model = new KataGoModelV8Tf(parsed);
+    loadedModelName = parsed.modelName;
+    loadedModelUrl = modelUrl;
+    search = null;
+    searchKey = null;
+    debugLog('log', 'Model loaded successfully (streaming)', { modelName: loadedModelName, modelUrl });
+
+    // Warmup compilation.
+    const spatial = tf.zeros([1, 19, 19, 22], 'float32') as tf.Tensor4D;
+    const global = tf.zeros([1, 19], 'float32') as tf.Tensor2D;
+    const out = model.forwardValueOnly(spatial, global);
+    await Promise.all([out.value.data(), out.scoreValue.data()]);
+    spatial.dispose();
+    global.dispose();
+    out.value.dispose();
+    out.scoreValue.dispose();
+    debugLog('log', 'Model warmed up successfully', { modelName: loadedModelName });
+  } else {
+    // fallback: 如果不支持 ReadableStream
+    const buf = new Uint8Array(await res.arrayBuffer());
+    const data = maybeUngzip(buf);
+    const parsed = parseKataGoModelV8(data);
+    model?.dispose();
+    model = new KataGoModelV8Tf(parsed);
+    loadedModelName = parsed.modelName;
+    loadedModelUrl = modelUrl;
+    search = null;
+    searchKey = null;
+    debugLog('log', 'Model loaded successfully (fallback)', { modelName: loadedModelName, modelUrl });
+  }
+}
+
+function post(msg: KataGoWorkerResponse, transfer?: Transferable[]) {
+  if (transfer && transfer.length > 0) self.postMessage(msg, transfer);
+  else self.postMessage(msg);
+}
+
+async function handleMessage(msg: KataGoWorkerRequest): Promise<void> {
+  // 处理调试开关设置（必须在 debugLog 之前）
+  if (msg.type === 'katago:set_debug') {
+    debugEnabled = msg.enabled;
+    // 始终打印确认消息（不受 debugEnabled 影响）
+    console.log(`[KataGo Worker] Debug mode ${msg.enabled ? 'enabled' : 'disabled'}`);
+    post({
+      type: 'katago:debug_log',
+      level: 'log',
+      message: `Debug mode ${msg.enabled ? 'enabled' : 'disabled'}`
+    });
+    return;
+  }
+  
+  debugLog('log', `Received message: ${msg.type}`, { id: 'id' in msg ? msg.id : undefined });
+  
+  if (msg.type === 'katago:init') {
+    // 从 init 消息中读取调试开关
+    debugEnabled = msg.debugEnabled ?? false;
+    
+    // 始终打印确认消息（不受 debugEnabled 影响）
+    console.log(`[KataGo Worker] Initialized, debug mode: ${debugEnabled ? 'enabled' : 'disabled'}`);
+    
+    debugLog('log', 'Handling init request', { modelUrl: msg.modelUrl, baseUrl: msg.baseUrl });
+    try {
+      // 1. 加载后端和模型
+      await ensureModel(msg.modelUrl);
+      
+      debugLog('log', 'Model loaded successfully', { 
+        backend: tf.getBackend(), 
+        modelName: loadedModelName 
+      });
+      
+      // 3. 返回成功
+      post({
+        type: 'katago:init_result',
+        ok: true,
+        backend: tf.getBackend(),
+        modelName: loadedModelName,
+      });
+    } catch (err) {
+      console.error('[KataGoWorker] init error:', err);
+      post({
+        type: 'katago:init_result',
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return;
+  }
+
+  if (msg.type === 'katago:eval') {
+    await ensureModel(msg.modelUrl);
+    if (!model) throw new Error('Model not loaded');
+    ensureBoardSizeForWorker(msg.board.length);
+    const boardSize = BOARD_SIZE;
+
+    const conservativePass = msg.conservativePass !== false;
+    const rules: GameRules = msg.rules === 'chinese' ? 'chinese' : msg.rules === 'korean' ? 'korean' : 'japanese';
+
+    fillInputsV7FastForPosition({
+      board: msg.board,
+      previousBoard: msg.previousBoard,
+      previousPreviousBoard: msg.previousPreviousBoard,
+      currentPlayer: msg.currentPlayer,
+      moveHistory: msg.moveHistory,
+      komi: msg.komi,
+      rules,
+      conservativePassAndIsRoot: conservativePass,
+      outSpatial: evalSpatialV7,
+      outGlobal: evalGlobalV7,
+    });
+
+    const spatial = tf.tensor4d(evalSpatialV7, [1, boardSize, boardSize, 22]);
+    const global = tf.tensor2d(evalGlobalV7, [1, 19]);
+    const out = model.forwardValueOnly(spatial, global);
+    const [valueLogitsArr, scoreValueArr] = await Promise.all([out.value.data(), out.scoreValue.data()]);
+    spatial.dispose();
+    global.dispose();
+    out.value.dispose();
+    out.scoreValue.dispose();
+
+    const evaled = postprocessKataGoV8({
+      nextPlayer: msg.currentPlayer,
+      valueLogits: valueLogitsArr,
+      scoreValue: scoreValueArr,
+      postProcessParams: model.postProcessParams,
+    });
+
+    post({
+      type: 'katago:eval_result',
+      id: msg.id,
+      ok: true,
+      backend: tf.getBackend(),
+      modelName: loadedModelName,
+      eval: {
+        rootWinRate: evaled.blackWinProb,
+        rootScoreLead: evaled.blackScoreLead,
+        rootScoreSelfplay: evaled.blackScoreMean,
+        rootScoreStdev: evaled.blackScoreStdev,
+      },
+    });
+    return;
+  }
+
+  if (msg.type === 'katago:eval_batch') {
+    await ensureModel(msg.modelUrl);
+    if (!model) throw new Error('Model not loaded');
+
+    const conservativePass = msg.conservativePass !== false;
+    const rules: GameRules = msg.rules === 'chinese' ? 'chinese' : msg.rules === 'korean' ? 'korean' : 'japanese';
+
+    const batch = msg.positions.length;
+    if (batch <= 0) {
+      post({
+        type: 'katago:eval_batch_result',
+        id: msg.id,
+        ok: true,
+        backend: tf.getBackend(),
+        modelName: loadedModelName,
+        evals: [],
+      });
+      return;
+    }
+
+    const boardSize = msg.positions[0] ? msg.positions[0].board.length : BOARD_SIZE;
+    ensureBoardSizeForWorker(boardSize);
+    const size = BOARD_SIZE;
+
+    const { spatial: spatialBatch, global: globalBatch } = getEvalBatchBuffersV7(batch);
+
+    for (let i = 0; i < batch; i++) {
+      const pos = msg.positions[i]!;
+      fillInputsV7FastForPosition({
+        board: pos.board,
+        previousBoard: pos.previousBoard,
+        previousPreviousBoard: pos.previousPreviousBoard,
+        currentPlayer: pos.currentPlayer,
+        moveHistory: pos.moveHistory,
+        komi: pos.komi,
+        rules,
+        conservativePassAndIsRoot: conservativePass,
+        outSpatial: spatialBatch.subarray(i * V7_SPATIAL_STRIDE, (i + 1) * V7_SPATIAL_STRIDE),
+        outGlobal: globalBatch.subarray(i * V7_GLOBAL_STRIDE, (i + 1) * V7_GLOBAL_STRIDE),
+      });
+    }
+
+    const spatial = tf.tensor4d(spatialBatch, [batch, size, size, 22]);
+    const global = tf.tensor2d(globalBatch, [batch, 19]);
+    const out = model.forwardValueOnly(spatial, global);
+    const [valueLogitsArr, scoreValueArr] = await Promise.all([out.value.data(), out.scoreValue.data()]);
+    spatial.dispose();
+    global.dispose();
+    out.value.dispose();
+    out.scoreValue.dispose();
+
+    const evals = new Array(batch);
+    for (let i = 0; i < batch; i++) {
+      const evaled = postprocessKataGoV8({
+        nextPlayer: msg.positions[i]!.currentPlayer,
+        valueLogits: valueLogitsArr.subarray(i * 3, i * 3 + 3),
+        scoreValue: scoreValueArr.subarray(i * 4, i * 4 + 4),
+        postProcessParams: model.postProcessParams,
+      });
+      evals[i] = {
+        rootWinRate: evaled.blackWinProb,
+        rootScoreLead: evaled.blackScoreLead,
+        rootScoreSelfplay: evaled.blackScoreMean,
+        rootScoreStdev: evaled.blackScoreStdev,
+      };
+    }
+
+    post({
+      type: 'katago:eval_batch_result',
+      id: msg.id,
+      ok: true,
+      backend: tf.getBackend(),
+      modelName: loadedModelName,
+      evals,
+    });
+    return;
+  }
+
+  if (msg.type === 'katago:analyze') {
+    const meta = analyzeMeta.get(msg);
+    const analysisGroup = meta?.analysisGroup ?? msg.analysisGroup ?? 'background';
+    const interactiveTokenAtEnqueue = meta?.interactiveToken ?? interactiveToken;
+    const isStale = () => latestAnalyzeByGroup.get(analysisGroup) !== msg.id;
+    const isPreemptedByInteractive =
+      analysisGroup !== 'interactive' && interactiveToken !== interactiveTokenAtEnqueue;
+    const shouldAbort = () => isStale() || isPreemptedByInteractive;
+    const postCanceled = () =>
+      post({
+        type: 'katago:analyze_result',
+        id: msg.id,
+        ok: false,
+        canceled: true,
+        error: 'canceled',
+      });
+
+    if (shouldAbort()) {
+      postCanceled();
+      return;
+    }
+
+    await ensureModel(msg.modelUrl);
+    if (!model) throw new Error('Model not loaded');
+    if (shouldAbort()) {
+      postCanceled();
+      return;
+    }
+
+    ensureBoardSizeForWorker(msg.board.length);
+    const boardSize = BOARD_SIZE;
+
+    const maxVisits = Math.max(16, Math.min(msg.visits ?? 256, ENGINE_MAX_VISITS));
+    const maxTimeMs = Math.max(25, Math.min(msg.maxTimeMs ?? 800, ENGINE_MAX_TIME_MS));
+    const batchSize = Math.max(1, Math.min(msg.batchSize ?? (tf.getBackend() === 'webgpu' ? 16 : 4), 64));
+    const maxChildren = Math.max(4, Math.min(msg.maxChildren ?? 64, BOARD_AREA));
+    const topK = Math.max(1, Math.min(msg.topK ?? 10, 50));
+    const includeMovesOwnership = msg.includeMovesOwnership === true;
+    const requestedOwnershipMode: OwnershipMode = msg.ownershipMode ?? 'root';
+    const ownershipMode: OwnershipMode = includeMovesOwnership ? 'tree' : requestedOwnershipMode;
+    const analysisPvLen = Math.max(0, Math.min(msg.analysisPvLen ?? 15, 60));
+    const wideRootNoise = Math.max(0, Math.min(msg.wideRootNoise ?? 0.04, 5));
+    const rules: GameRules = msg.rules === 'chinese' ? 'chinese' : msg.rules === 'korean' ? 'korean' : 'japanese';
+    const nnRandomize = msg.nnRandomize !== false;
+    const conservativePass = msg.conservativePass !== false;
+    const roiKey = regionKey(msg.regionOfInterest);
+    const reportEveryMsRaw = msg.reportDuringSearchEveryMs;
+    const reportEveryMs =
+      typeof reportEveryMsRaw === 'number' && Number.isFinite(reportEveryMsRaw)
+        ? Math.max(0, reportEveryMsRaw)
+        : 0;
+    const shouldReport = reportEveryMs > 0;
+    const cloneBuffers = msg.reuseTree === true || shouldReport;
+
+    const canReuse =
+      msg.reuseTree === true &&
+      typeof msg.positionId === 'string' &&
+      !!search &&
+      !!searchKey &&
+      searchKey.positionId === msg.positionId &&
+      searchKey.modelUrl === msg.modelUrl &&
+      searchKey.boardSize === boardSize &&
+      searchKey.maxChildren === maxChildren &&
+      searchKey.ownershipMode === ownershipMode &&
+      searchKey.komi === msg.komi &&
+      searchKey.currentPlayer === msg.currentPlayer &&
+      searchKey.wideRootNoise === wideRootNoise &&
+      searchKey.rules === rules &&
+      searchKey.nnRandomize === nnRandomize &&
+      searchKey.conservativePass === conservativePass &&
+      searchKey.roiKey === roiKey;
+
+    let reusedSearch = canReuse;
+
+    // Re-root the existing search when the new position is a direct child of the current root.
+    if (
+      !reusedSearch &&
+      msg.reuseTree === true &&
+      search &&
+      searchKey &&
+      typeof msg.positionId === 'string' &&
+      typeof msg.parentPositionId === 'string'
+    ) {
+      const canReRoot =
+        searchKey.positionId === msg.parentPositionId &&
+        searchKey.modelUrl === msg.modelUrl &&
+        searchKey.maxChildren === maxChildren &&
+        searchKey.ownershipMode === ownershipMode &&
+        searchKey.komi === msg.komi &&
+        searchKey.wideRootNoise === wideRootNoise &&
+        searchKey.rules === rules &&
+        searchKey.nnRandomize === nnRandomize &&
+        searchKey.conservativePass === conservativePass &&
+        searchKey.roiKey === roiKey;
+
+      if (canReRoot) {
+        const lastMove = msg.moveHistory[msg.moveHistory.length - 1] ?? null;
+        const move =
+          lastMove && lastMove.x >= 0 && lastMove.y >= 0 ? lastMove.y * BOARD_SIZE + lastMove.x : PASS_MOVE;
+        if (lastMove) {
+          const reRooted = await search.reRootToChild({
+            move,
+            board: msg.board,
+            previousBoard: msg.previousBoard,
+            previousPreviousBoard: msg.previousPreviousBoard,
+            currentPlayer: msg.currentPlayer,
+            moveHistory: msg.moveHistory,
+            komi: msg.komi,
+            rules,
+            regionOfInterest: msg.regionOfInterest,
+          });
+          if (reRooted) {
+            reusedSearch = true;
+            searchKey = {
+              positionId: msg.positionId,
+              modelUrl: msg.modelUrl,
+              boardSize,
+              maxChildren,
+              ownershipMode,
+              komi: msg.komi,
+              currentPlayer: msg.currentPlayer,
+              wideRootNoise,
+              rules,
+              nnRandomize,
+              conservativePass,
+              roiKey,
+            };
+          }
+        }
+      }
+    }
+
+    if (!reusedSearch) {
+      search = await MctsSearch.create({
+        model,
+        board: msg.board,
+        previousBoard: msg.previousBoard,
+        previousPreviousBoard: msg.previousPreviousBoard,
+        currentPlayer: msg.currentPlayer,
+        moveHistory: msg.moveHistory,
+        komi: msg.komi,
+        rules,
+        nnRandomize,
+        conservativePass,
+        maxChildren,
+        ownershipMode,
+        wideRootNoise,
+        regionOfInterest: msg.regionOfInterest,
+      });
+      if (typeof msg.positionId === 'string') {
+        searchKey = {
+          positionId: msg.positionId,
+          modelUrl: msg.modelUrl,
+          boardSize,
+          maxChildren,
+          ownershipMode,
+          komi: msg.komi,
+          currentPlayer: msg.currentPlayer,
+          wideRootNoise,
+          rules,
+          nnRandomize,
+          conservativePass,
+          roiKey,
+        };
+      } else {
+        searchKey = null;
+      }
+    }
+
+    const postAnalysis = (analysis: ReturnType<MctsSearch['getAnalysis']>, type: 'katago:analyze_update' | 'katago:analyze_result') => {
+      const transfer: Transferable[] = [];
+      const push = (value?: unknown) => {
+        if (value && ArrayBuffer.isView(value)) transfer.push(value.buffer);
+      };
+      push(analysis.ownership);
+      push(analysis.ownershipStdev);
+      push(analysis.policy);
+      for (const move of analysis.moves) push(move.ownership);
+
+      post(
+        {
+          type,
+          id: msg.id,
+          ok: true,
+          backend: tf.getBackend(),
+          modelName: loadedModelName,
+          analysis,
+        },
+        transfer
+      );
+    };
+
+    const buildAnalysis = () =>
+      search!.getAnalysis({
+        topK,
+        includeMovesOwnership,
+        analysisPvLen,
+        cloneBuffers,
+        ownershipRefreshIntervalMs: msg.ownershipRefreshIntervalMs,
+      });
+
+    if (!shouldReport) {
+      const aborted = await search!.run({ visits: maxVisits, maxTimeMs, batchSize, shouldAbort });
+      if (aborted || shouldAbort()) {
+        postCanceled();
+        if (msg.reuseTree !== true) {
+          search = null;
+          searchKey = null;
+        }
+        return;
+      }
+      postAnalysis(buildAnalysis(), 'katago:analyze_result');
+      if (msg.reuseTree !== true) {
+        search = null;
+        searchKey = null;
+      }
+      return;
+    }
+
+    const deadline = performance.now() + maxTimeMs;
+    let lastReportVisits = -1;
+    while (true) {
+      if (shouldAbort()) {
+        postCanceled();
+        if (msg.reuseTree !== true) {
+          search = null;
+          searchKey = null;
+        }
+        return;
+      }
+      const now = performance.now();
+      const remaining = deadline - now;
+      if (remaining <= 0) break;
+      const sliceMs = Math.min(reportEveryMs, remaining);
+      const aborted = await search!.run({ visits: maxVisits, maxTimeMs: sliceMs, batchSize, shouldAbort });
+      if (aborted || shouldAbort()) {
+        postCanceled();
+        if (msg.reuseTree !== true) {
+          search = null;
+          searchKey = null;
+        }
+        return;
+      }
+      const analysis = buildAnalysis();
+      const done = analysis.rootVisits >= maxVisits || performance.now() >= deadline;
+      if (done) {
+        postAnalysis(analysis, 'katago:analyze_result');
+        if (msg.reuseTree !== true) {
+          search = null;
+          searchKey = null;
+        }
+        return;
+      }
+      if (analysis.rootVisits > lastReportVisits) {
+        lastReportVisits = analysis.rootVisits;
+        postAnalysis(analysis, 'katago:analyze_update');
+      }
+    }
+
+    postAnalysis(buildAnalysis(), 'katago:analyze_result');
+    if (msg.reuseTree !== true) {
+      search = null;
+      searchKey = null;
+    }
+  }
+}
+
+self.onmessage = (ev: MessageEvent<KataGoWorkerRequest>) => {
+  const msg = ev.data;
+  if (msg.type === 'katago:analyze') {
+    const analysisGroup = msg.analysisGroup ?? 'background';
+    latestAnalyzeByGroup.set(analysisGroup, msg.id);
+    if (analysisGroup === 'interactive') interactiveToken++;
+    analyzeMeta.set(msg, { analysisGroup, interactiveToken });
+  }
+  queue = queue
+    .then(() => handleMessage(msg))
+    .catch((err: unknown) => {
+      if (msg.type === 'katago:init') {
+        post({
+          type: 'katago:init_result',
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return;
+      }
+      if (msg.type === 'katago:eval') {
+        post({
+          type: 'katago:eval_result',
+          id: msg.id,
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return;
+      }
+      if (msg.type === 'katago:eval_batch') {
+        post({
+          type: 'katago:eval_batch_result',
+          id: msg.id,
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return;
+      }
+      if (msg.type === 'katago:analyze') {
+        post({
+          type: 'katago:analyze_result',
+          id: msg.id,
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return;
+      }
+    });
+};
