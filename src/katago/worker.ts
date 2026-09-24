@@ -503,17 +503,6 @@ async function loadModelFromBuffer(modelUrl: string, buf: Uint8Array): Promise<v
   search = null;
   searchKey = null;
   debugLog('log', 'Model loaded successfully', { modelName: loadedModelName, modelUrl });
-
-  // Warmup compilation.
-  const spatial = tf.zeros([1, 19, 19, 22], 'float32') as tf.Tensor4D;
-  const global = tf.zeros([1, 19], 'float32') as tf.Tensor2D;
-  const out = model.forwardValueOnly(spatial, global);
-  await Promise.all([out.value.data(), out.scoreValue.data()]);
-  spatial.dispose();
-  global.dispose();
-  out.value.dispose();
-  out.scoreValue.dispose();
-  debugLog('log', 'Model warmed up successfully', { modelName: loadedModelName });
 }
 
 async function loadModelFromResponse(modelUrl: string, res: Response): Promise<void> {
