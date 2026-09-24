@@ -548,34 +548,27 @@ async function loadModelFromResponse(modelUrl: string, res: Response): Promise<v
 
 async function ensureModel(modelUrl: string): Promise<void> {
   debugLog('log', 'ensureModel called', { modelUrl, currentLoadedUrl: loadedModelUrl });
-  console.log('[KataGo Cache] ensureModel 开始, modelUrl =', modelUrl);
   
   await ensureBackend();
   if (model && loadedModelUrl === modelUrl) {
-    console.log('[KataGo Cache] 内存已加载该模型，直接复用（无网络）', modelUrl);
     debugLog('log', 'Model already loaded, reusing', { modelName: loadedModelName });
     return;
   }
   
   // 优先从 IndexedDB 读取（跨刷新/重开页面复用，避免重复下载）
   const key = normalizeModelKey(modelUrl);
-  console.log('[KataGo Cache] IndexedDB key =', key);
   try {
     const cached = await idbGetBuffer(key);
     if (cached && cached.byteLength > 0) {
-      console.log('[KataGo Cache] ✅ IndexedDB 命中，从本地读取（不发网络请求），字节数 =', cached.byteLength);
       debugLog('log', 'Model IndexedDB hit, loading from local', { key, bytes: cached.byteLength });
       await loadModelFromBuffer(modelUrl, new Uint8Array(cached));
       return;
     }
-    console.log('[KataGo Cache] ❌ IndexedDB 未命中，需要走网络下载', key);
   } catch (e) {
-    console.log('[KataGo Cache] ⚠️ IndexedDB 读取异常，降级走网络', e);
     debugLog('error', 'Model IndexedDB get failed, falling back to network', e);
   }
 
   // 使用流式下载以支持进度报告，并写入 IndexedDB
-  console.log('[KataGo Cache] ⬇️ 开始下载模型(网络请求):', modelUrl);
   const res = await fetch(modelUrl);
   if (!res.ok) throw new Error(`Failed to fetch model: ${res.status} ${res.statusText}`);
   await loadModelFromResponse(modelUrl, res);
