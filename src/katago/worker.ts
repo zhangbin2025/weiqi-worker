@@ -6,6 +6,18 @@ import '@tensorflow/tfjs-backend-wasm';
 import { setWasmPaths, setThreadsCount } from '@tensorflow/tfjs-backend-wasm';
 import pako from 'pako';
 
+// 防止 WebGL 后端 GPU 纹理缓存无限增长（复盘 199 手会累积成千上万次 NN 推理，
+// TF.js WebGL 默认会缓存大量 GL texture 不释放，导致显存/内存爆炸）。
+// 设置较低的回收阈值，让未使用的纹理尽快被 dispose，从而把显存控制在有界范围。
+try {
+  // 默认值为 5：当未使用纹理数量超过上限的 5% 时才清理。
+  // 复盘一局会累积成千上万次 NN 推理，默认策略会让 GL 纹理无限堆积导致显存爆炸。
+  // 设为 0：任何不再被引用的纹理都会尽快被 dispose，使显存保持有界。
+  tf.env().set('WEBGL_DELETE_TEXTURE_THRESHOLD', 0);
+} catch {
+  // 某些 TF.js 版本/后端不支持该选项，忽略即可
+}
+
 import type { KataGoAnalyzeRequest, KataGoWorkerRequest, KataGoWorkerResponse } from './types';
 import type { BoardState, GameRules, Move, Player, RegionOfInterest } from '../types';
 import { publicUrl } from '../utils/publicUrl';
