@@ -413,129 +413,170 @@ async function ensureBackend(): Promise<void> {
   await backendPromise;
 }
 
-// 模型缓存（浏览器 Cache Storage，跨刷新/重开页面复用，避免重复下载）
-// 注意：Worker 线程内可访问全局 caches；非浏览器环境（Node）下跳过缓存。
-const MODEL_CACHE_NAME = 'katago-models-v1';
+// 模型缓存（IndexedDB，跨刷新/重开页面复用，避免重复下载）
+// 注意：不能用浏览器 Cache Storage —— Cloudflare Worker Assets 返回的响应
+// 无法被 Cache.put 写入（报 NetworkError），所以改用 IndexedDB 直接存模型字节。
+// IndexedDB 在 Web Worker 内可用，不受跨源/缓存头限制，且持久化于磁盘。
+const MODEL_DB_NAME = 'katago-models-idb-v1';
+const MODEL_STORE = 'models';
 
-async function getModelCache(): Promise<Cache | null> {
+// 规范化 URL 作为存储 key：相对路径补全为同源绝对 URL，保证刷新/不同入口一致命中
+function normalizeModelKey(modelUrl: string): string {
   try {
-    if (typeof caches === 'undefined') return null;
-    return await caches.open(MODEL_CACHE_NAME);
+    if (modelUrl.startsWith('http://') || modelUrl.startsWith('https://')) return modelUrl;
+    const origin = (self.location && self.location.origin) ? self.location.origin : '';
+    return new URL(modelUrl, origin || 'https://bot.weiqi.lol').href;
+  } catch {
+    return modelUrl;
+  }
+}
+
+async function getModelStore(mode: IDBTransactionMode): Promise<IDBObjectStore | null> {
+  try {
+    if (typeof indexedDB === 'undefined') return null;
+    return await new Promise<IDBObjectStore>((resolve, reject) => {
+      const req = indexedDB.open(MODEL_DB_NAME, 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(MODEL_STORE)) {
+          db.createObjectStore(MODEL_STORE);
+        }
+      };
+      req.onsuccess = () => {
+        const db = req.result;
+        try {
+          const tx = db.transaction(MODEL_STORE, mode);
+          resolve(tx.objectStore(MODEL_STORE));
+        } catch (e) { reject(e); }
+      };
+      req.onerror = () => reject(req.error);
+    });
   } catch {
     return null;
   }
 }
 
+async function idbGetBuffer(key: string): Promise<ArrayBuffer | null> {
+  const store = await getModelStore('readonly');
+  if (!store) return null;
+  return await new Promise<ArrayBuffer | null>((resolve) => {
+    try {
+      const req = store.get(key);
+      req.onsuccess = () => resolve((req.result as ArrayBuffer) ?? null);
+      req.onerror = () => resolve(null);
+    } catch { resolve(null); }
+  });
+}
+
+async function idbPutBuffer(key: string, buf: ArrayBufferLike): Promise<boolean> {
+  const store = await getModelStore('readwrite');
+  if (!store) return false;
+  return await new Promise<boolean>((resolve) => {
+    try {
+      const req = store.put(buf, key);
+      req.onsuccess = () => resolve(true);
+      req.onerror = () => resolve(false);
+    } catch { resolve(false); }
+  });
+}
+
+// 从已下载的字节加载模型（流式进度 + 解析 + 入 IndexedDB）
+async function loadModelFromBuffer(modelUrl: string, buf: Uint8Array): Promise<void> {
+  const data = maybeUngzip(buf);
+  const parsed = parseKataGoModelV8(data);
+  model?.dispose();
+  model = new KataGoModelV8Tf(parsed);
+  loadedModelName = parsed.modelName;
+  loadedModelUrl = modelUrl;
+  search = null;
+  searchKey = null;
+  debugLog('log', 'Model loaded successfully', { modelName: loadedModelName, modelUrl });
+
+  // Warmup compilation.
+  const spatial = tf.zeros([1, 19, 19, 22], 'float32') as tf.Tensor4D;
+  const global = tf.zeros([1, 19], 'float32') as tf.Tensor2D;
+  const out = model.forwardValueOnly(spatial, global);
+  await Promise.all([out.value.data(), out.scoreValue.data()]);
+  spatial.dispose();
+  global.dispose();
+  out.value.dispose();
+  out.scoreValue.dispose();
+  debugLog('log', 'Model warmed up successfully', { modelName: loadedModelName });
+}
+
 async function loadModelFromResponse(modelUrl: string, res: Response): Promise<void> {
   debugLog('log', 'Starting model download', { modelUrl });
 
-  const contentLength = res.headers.get('content-length');
-  const total = contentLength ? parseInt(contentLength, 10) : 0;
-
-  let loaded = 0;
-  const chunks: Uint8Array[] = [];
+  let buf: Uint8Array;
 
   if (res.body) {
+    const contentLength = res.headers.get('content-length');
+    const total = contentLength ? parseInt(contentLength, 10) : 0;
+    let loaded = 0;
+    const chunks: Uint8Array[] = [];
     const reader = res.body.getReader();
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       chunks.push(value);
       loaded += value.length;
-
-      // 报告下载进度
       if (total > 0) {
-        const progress = Math.min((loaded / total) * 100, 100);  // 限制不超过 100%
-        post({
-          type: 'katago:progress',
-          loaded,
-          total,
-          progress
-        });
+        const progress = Math.min((loaded / total) * 100, 100);
+        post({ type: 'katago:progress', loaded, total, progress });
       }
     }
-
-    // 合并所有 chunks
-    const buf = new Uint8Array(loaded);
+    buf = new Uint8Array(loaded);
     let offset = 0;
-    for (const chunk of chunks) {
-      buf.set(chunk, offset);
-      offset += chunk.length;
-    }
-
-    const data = maybeUngzip(buf);
-    const parsed = parseKataGoModelV8(data);
-    model?.dispose();
-    model = new KataGoModelV8Tf(parsed);
-    loadedModelName = parsed.modelName;
-    loadedModelUrl = modelUrl;
-    search = null;
-    searchKey = null;
-    debugLog('log', 'Model loaded successfully (streaming)', { modelName: loadedModelName, modelUrl });
-
-    // Warmup compilation.
-    const spatial = tf.zeros([1, 19, 19, 22], 'float32') as tf.Tensor4D;
-    const global = tf.zeros([1, 19], 'float32') as tf.Tensor2D;
-    const out = model.forwardValueOnly(spatial, global);
-    await Promise.all([out.value.data(), out.scoreValue.data()]);
-    spatial.dispose();
-    global.dispose();
-    out.value.dispose();
-    out.scoreValue.dispose();
-    debugLog('log', 'Model warmed up successfully', { modelName: loadedModelName });
+    for (const chunk of chunks) { buf.set(chunk, offset); offset += chunk.length; }
   } else {
-    // fallback: 如果不支持 ReadableStream
-    const buf = new Uint8Array(await res.arrayBuffer());
-    const data = maybeUngzip(buf);
-    const parsed = parseKataGoModelV8(data);
-    model?.dispose();
-    model = new KataGoModelV8Tf(parsed);
-    loadedModelName = parsed.modelName;
-    loadedModelUrl = modelUrl;
-    search = null;
-    searchKey = null;
-    debugLog('log', 'Model loaded successfully (fallback)', { modelName: loadedModelName, modelUrl });
+    buf = new Uint8Array(await res.arrayBuffer());
   }
+
+  // 持久化到 IndexedDB（下次刷新可直接命中，零网络）
+  const key = normalizeModelKey(modelUrl);
+  try {
+    const ok = await idbPutBuffer(key, buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+    if (ok) debugLog('log', 'Model bytes persisted to IndexedDB', { key });
+    else debugLog('error', 'Model IndexedDB put failed, will re-download next time');
+  } catch (e) {
+    debugLog('error', 'Model IndexedDB put threw', e);
+  }
+
+  await loadModelFromBuffer(modelUrl, buf);
 }
 
 async function ensureModel(modelUrl: string): Promise<void> {
   debugLog('log', 'ensureModel called', { modelUrl, currentLoadedUrl: loadedModelUrl });
+  console.log('[KataGo Cache] ensureModel 开始, modelUrl =', modelUrl);
   
   await ensureBackend();
   if (model && loadedModelUrl === modelUrl) {
+    console.log('[KataGo Cache] 内存已加载该模型，直接复用（无网络）', modelUrl);
     debugLog('log', 'Model already loaded, reusing', { modelName: loadedModelName });
     return;
   }
   
-  // 优先从浏览器 Cache Storage 读取（跨刷新/重开页面复用，避免重复下载）
-  const cache = await getModelCache();
-  if (cache) {
-    try {
-      const cached = await cache.match(modelUrl);
-      if (cached) {
-        debugLog('log', 'Model cache hit, reusing without network', { modelUrl });
-        await loadModelFromResponse(modelUrl, cached);
-        return;
-      }
-    } catch (e) {
-      debugLog('error', 'Model cache match failed, falling back to network', e);
+  // 优先从 IndexedDB 读取（跨刷新/重开页面复用，避免重复下载）
+  const key = normalizeModelKey(modelUrl);
+  console.log('[KataGo Cache] IndexedDB key =', key);
+  try {
+    const cached = await idbGetBuffer(key);
+    if (cached && cached.byteLength > 0) {
+      console.log('[KataGo Cache] ✅ IndexedDB 命中，从本地读取（不发网络请求），字节数 =', cached.byteLength);
+      debugLog('log', 'Model IndexedDB hit, loading from local', { key, bytes: cached.byteLength });
+      await loadModelFromBuffer(modelUrl, new Uint8Array(cached));
+      return;
     }
+    console.log('[KataGo Cache] ❌ IndexedDB 未命中，需要走网络下载', key);
+  } catch (e) {
+    console.log('[KataGo Cache] ⚠️ IndexedDB 读取异常，降级走网络', e);
+    debugLog('error', 'Model IndexedDB get failed, falling back to network', e);
   }
 
-  // 使用流式下载以支持进度报告
+  // 使用流式下载以支持进度报告，并写入 IndexedDB
+  console.log('[KataGo Cache] ⬇️ 开始下载模型(网络请求):', modelUrl);
   const res = await fetch(modelUrl);
   if (!res.ok) throw new Error(`Failed to fetch model: ${res.status} ${res.statusText}`);
-
-  // 写入缓存（不影响当前响应体，clone 一份）
-  if (cache) {
-    try {
-      await cache.put(modelUrl, res.clone());
-      debugLog('log', 'Model cached', { modelUrl });
-    } catch (e) {
-      debugLog('error', 'Model cache put failed', e);
-    }
-  }
-
   await loadModelFromResponse(modelUrl, res);
 }
 
