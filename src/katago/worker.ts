@@ -413,21 +413,21 @@ async function ensureBackend(): Promise<void> {
   await backendPromise;
 }
 
-async function ensureModel(modelUrl: string): Promise<void> {
-  debugLog('log', 'ensureModel called', { modelUrl, currentLoadedUrl: loadedModelUrl });
-  
-  await ensureBackend();
-  if (model && loadedModelUrl === modelUrl) {
-    debugLog('log', 'Model already loaded, reusing', { modelName: loadedModelName });
-    return;
+// 模型缓存（浏览器 Cache Storage，跨刷新/重开页面复用，避免重复下载）
+// 注意：Worker 线程内可访问全局 caches；非浏览器环境（Node）下跳过缓存。
+const MODEL_CACHE_NAME = 'katago-models-v1';
+
+async function getModelCache(): Promise<Cache | null> {
+  try {
+    if (typeof caches === 'undefined') return null;
+    return await caches.open(MODEL_CACHE_NAME);
+  } catch {
+    return null;
   }
-  
+}
+
+async function loadModelFromResponse(modelUrl: string, res: Response): Promise<void> {
   debugLog('log', 'Starting model download', { modelUrl });
-
-
-  // 使用流式下载以支持进度报告
-  const res = await fetch(modelUrl);
-  if (!res.ok) throw new Error(`Failed to fetch model: ${res.status} ${res.statusText}`);
 
   const contentLength = res.headers.get('content-length');
   const total = contentLength ? parseInt(contentLength, 10) : 0;
@@ -496,6 +496,47 @@ async function ensureModel(modelUrl: string): Promise<void> {
     searchKey = null;
     debugLog('log', 'Model loaded successfully (fallback)', { modelName: loadedModelName, modelUrl });
   }
+}
+
+async function ensureModel(modelUrl: string): Promise<void> {
+  debugLog('log', 'ensureModel called', { modelUrl, currentLoadedUrl: loadedModelUrl });
+  
+  await ensureBackend();
+  if (model && loadedModelUrl === modelUrl) {
+    debugLog('log', 'Model already loaded, reusing', { modelName: loadedModelName });
+    return;
+  }
+  
+  // 优先从浏览器 Cache Storage 读取（跨刷新/重开页面复用，避免重复下载）
+  const cache = await getModelCache();
+  if (cache) {
+    try {
+      const cached = await cache.match(modelUrl);
+      if (cached) {
+        debugLog('log', 'Model cache hit, reusing without network', { modelUrl });
+        await loadModelFromResponse(modelUrl, cached);
+        return;
+      }
+    } catch (e) {
+      debugLog('error', 'Model cache match failed, falling back to network', e);
+    }
+  }
+
+  // 使用流式下载以支持进度报告
+  const res = await fetch(modelUrl);
+  if (!res.ok) throw new Error(`Failed to fetch model: ${res.status} ${res.statusText}`);
+
+  // 写入缓存（不影响当前响应体，clone 一份）
+  if (cache) {
+    try {
+      await cache.put(modelUrl, res.clone());
+      debugLog('log', 'Model cached', { modelUrl });
+    } catch (e) {
+      debugLog('error', 'Model cache put failed', e);
+    }
+  }
+
+  await loadModelFromResponse(modelUrl, res);
 }
 
 function post(msg: KataGoWorkerResponse, transfer?: Transferable[]) {
